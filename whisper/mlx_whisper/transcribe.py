@@ -50,12 +50,14 @@ def _get_end(segments: List[dict]) -> Optional[float]:
 class ModelHolder:
     model = None
     model_path = None
+    dtype = None
 
     @classmethod
     def get_model(cls, model_path: str, dtype: mx.Dtype):
-        if cls.model is None or model_path != cls.model_path:
+        if cls.model is None or model_path != cls.model_path or dtype != cls.dtype:
             cls.model = load_model(model_path, dtype=dtype)
             cls.model_path = model_path
+            cls.dtype = dtype
         return cls.model
 
 
@@ -75,6 +77,8 @@ def transcribe(
     append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
     clip_timestamps: Union[str, List[float]] = "0",
     hallucination_silence_threshold: Optional[float] = None,
+    silence_padding: bool = False,
+    cache_limit_mb: Optional[float] = 1024,
     **decode_options,
 ):
     """
@@ -137,11 +141,31 @@ def transcribe(
         When word_timestamps is True, skip silent periods longer than this threshold (in seconds)
         when a possible hallucination is detected
 
+    silence_padding: bool
+        Fill the rest of the last (or only) window with log-mel frames of real silence, as HF's
+        feature extractor and transcribe.cpp do, instead of 0.0 in log-mel space (openai-whisper's
+        behaviour, which the model hears as steady noise ~30-40 dB above silence). nb-whisper was
+        fine-tuned on HF features. Windows cut short by clip_timestamps keep 0.0 padding.
+
+    cache_limit_mb: Optional[float]
+        Limit (in MB) for MLX's buffer cache of freed GPU buffers. This is process-wide and set
+        on every call. Under MLX's default limit the cache grows to ~33 GB on large models at
+        beam 5 and transcription runs 25-36% slower than with 1024 MB, with identical output.
+        None leaves MLX's current setting unchanged.
+
+    beam_size: Union[int, None]
+        Number of beams to use in beam search decoding. A higher number can improve results for
+        languages with a lot of compound words, but will make decoding slower. If None, greedy
+        decoding is used.
+
     Returns
     -------
     A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
+
+    if cache_limit_mb is not None:
+        mx.set_cache_limit(int(cache_limit_mb * 1024 * 1024))
 
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
     model = ModelHolder.get_model(path_or_hf_repo, dtype)
@@ -289,7 +313,12 @@ def transcribe(
                 segment_size = min(
                     N_FRAMES, content_frames - seek, seek_clip_end - seek
                 )
-                mel_segment = mel[seek : seek + segment_size]
+                if silence_padding and seek + segment_size >= content_frames:
+                    # The window reaches the end of the audio: read on into the
+                    # audio padding, whose log-mel frames are real silence.
+                    mel_segment = mel[seek : seek + N_FRAMES]
+                else:
+                    mel_segment = mel[seek : seek + segment_size]
                 segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
                 mel_segment = pad_or_trim(mel_segment, N_FRAMES, axis=-2).astype(dtype)
 
@@ -364,6 +393,8 @@ def transcribe(
                         sliced_tokens = tokens[last_slice:current_slice]
                         start_timestamp_pos = (
                             sliced_tokens[0].item() - tokenizer.timestamp_begin
+                            if sliced_tokens[0].item() >= tokenizer.timestamp_begin
+                            else 0
                         )
                         end_timestamp_pos = (
                             sliced_tokens[-1].item() - tokenizer.timestamp_begin
