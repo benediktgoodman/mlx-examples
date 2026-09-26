@@ -148,9 +148,8 @@ class Inference:
         computed from the audio features, which ``DecodingTask.run`` repeats for
         every beam of an audio item, and a beam only ever takes over a beam of
         the same audio item, so gathering it would copy identical rows (~1.2 GB
-        per step on large models at beam 5). Output is bit-identical to a full
-        gather; ``tests/test_cross_kv_skip.py`` checks this against
-        ``kv_experiments.rearrange_full_kv``.
+        per step on large models at beam 5). The result is bit-identical to a
+        full gather of both caches.
         """
         if source_indices != list(range(len(source_indices))):
             self.kv_cache = [
@@ -292,9 +291,9 @@ class BeamSearchDecoder(TokenDecoder):
         self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences: list[dict[tuple[int, ...], float]] | None = None
 
-        assert self.max_candidates > 0, (
-            f"Invalid beam size ({beam_size}) or patience ({patience})"
-        )
+        assert (
+            self.max_candidates > 0
+        ), f"Invalid beam size ({beam_size}) or patience ({patience})"
 
     def reset(self):
         """Reset state for a new decoding run."""
@@ -320,7 +319,11 @@ class BeamSearchDecoder(TokenDecoder):
         return logprobs_np, sum_logprobs_np
 
     def _score_candidates_for_audio(
-        self, i: int, tokens_list: list, logprobs_np: np.ndarray, sum_logprobs_np: np.ndarray
+        self,
+        i: int,
+        tokens_list: list,
+        logprobs_np: np.ndarray,
+        sum_logprobs_np: np.ndarray,
     ) -> tuple[dict, dict]:
         """Score candidates for a single audio sample.
 
@@ -340,9 +343,7 @@ class BeamSearchDecoder(TokenDecoder):
 
             for tok_idx in top_indices:
                 token = int(tok_idx)
-                new_logprob = float(
-                    sum_logprobs_np[idx] + logprobs_np[idx][tok_idx]
-                )
+                new_logprob = float(sum_logprobs_np[idx] + logprobs_np[idx][tok_idx])
                 sequence = tuple(prefix + [token])
                 scores[sequence] = new_logprob
                 sources[sequence] = idx
@@ -436,8 +437,8 @@ class BeamSearchDecoder(TokenDecoder):
                 i, tokens_list, logprobs_np, sum_logprobs_np
             )
 
-            beam_next_tokens, beam_source_indices, finished = self._select_top_beams_and_finished(
-                scores, sources
+            beam_next_tokens, beam_source_indices, finished = (
+                self._select_top_beams_and_finished(scores, sources)
             )
 
             next_tokens.extend(beam_next_tokens)
@@ -639,15 +640,14 @@ class ApplyTimestampRules(LogitFilter):
                 else:  # cannot be normal text tokens
                     mask[k, : self.tokenizer.eot] = -np.inf
 
-            timestamps = [
-                i for i, v in enumerate(seq) if v > self.tokenizer.timestamp_begin
-            ]
+            timestamps = [v for v in seq if v >= self.tokenizer.timestamp_begin]
             if len(timestamps) > 0:
                 # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
                 # also force each segment to have a nonzero length, to prevent infinite looping
-                last_timestamp = timestamps[-1]
-                if not last_timestamp or penultimate_was_timestamp:
-                    last_timestamp += 1
+                if last_was_timestamp and not penultimate_was_timestamp:
+                    last_timestamp = timestamps[-1]
+                else:
+                    last_timestamp = timestamps[-1] + 1
                 mask[k, self.tokenizer.timestamp_begin : last_timestamp] = -np.inf
 
         if len(tokens[0]) == self.sample_begin:
@@ -662,8 +662,12 @@ class ApplyTimestampRules(LogitFilter):
                 mask[:, last_allowed + 1 :] = -np.inf
 
         # if sum of probability over timestamps is above any other token, sample timestamp
+        # decide on the masked logits, as openai/whisper and transformers do — deciding
+        # on the raw logits can mask every token after a closed timestamp pair, because
+        # the pair mask has already zeroed the timestamps
         mask = mx.array(mask)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        masked = logits + mask
+        logprobs = masked - mx.logsumexp(masked, axis=-1, keepdims=True)
         timestamp_logprob = logprobs[:, self.tokenizer.timestamp_begin :].logsumexp(
             axis=-1, keepdims=True
         )
